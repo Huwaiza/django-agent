@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.sqlite
+db/orchestrator_state.json
+db/memory.sqlite
+logs/*.log
+.env
+*.tar.gz
+.idea
