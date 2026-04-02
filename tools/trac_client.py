@@ -112,7 +112,6 @@ class TracClient:
             "status": ["new", "assigned"],
             "easy": "1",
             "has_patch": "0",
-            "stage": "Accepted",
             "format": "csv",
             "col": [
                 "id", "summary", "component", "type", "severity",
@@ -187,27 +186,38 @@ class TracClient:
         resp = self.session.get(url, timeout=30)
         resp.raise_for_status()
 
-        reader = csv.DictReader(io.StringIO(resp.text))
+        # Trac CSV responses have a UTF-8 BOM; use utf-8-sig to strip it.
+        # Column names from Trac are Title-cased and differ from query param names:
+        #   id, Summary, Component, Type, Severity, Version, Owner, Reporter,
+        #   Status, Triage Stage, Has patch, Patch needs improvement,
+        #   Needs tests, Needs documentation
+        text = resp.content.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
         tickets = []
         for row in reader:
+            try:
+                ticket_id = int(row["id"])
+            except (KeyError, ValueError) as e:
+                logger.warning("Skipping row with missing/invalid id: %s (keys: %s)", e, list(row.keys()))
+                continue
             tickets.append(TracTicket(
-                ticket_id=int(row["id"]),
-                summary=row.get("summary", ""),
-                component=row.get("component", ""),
-                ticket_type=row.get("type", ""),
-                severity=row.get("severity", ""),
-                version=row.get("version", ""),
-                owner=row.get("owner", ""),
-                reporter=row.get("reporter", ""),
-                status=row.get("status", ""),
-                stage=row.get("stage", ""),
-                has_patch=row.get("has_patch", "0") == "1",
-                needs_better_patch=row.get("needs_better_patch", "0") == "1",
-                needs_tests=row.get("needs_tests", "0") == "1",
-                needs_docs=row.get("needs_docs", "0") == "1",
+                ticket_id=ticket_id,
+                summary=row.get("Summary", ""),
+                component=row.get("Component", ""),
+                ticket_type=row.get("Type", ""),
+                severity=row.get("Severity", ""),
+                version=row.get("Version", ""),
+                owner=row.get("Owner", ""),
+                reporter=row.get("Reporter", ""),
+                status=row.get("Status", ""),
+                stage=row.get("Triage Stage", ""),
+                has_patch=row.get("Has patch", "0") == "1",
+                needs_better_patch=row.get("Patch needs improvement", "0") == "1",
+                needs_tests=row.get("Needs tests", "0") == "1",
+                needs_docs=row.get("Needs documentation", "0") == "1",
                 easy_picking=True,
-                created=row.get("created", ""),
-                modified=row.get("modified", ""),
+                created=row.get("created", row.get("Created", "")),
+                modified=row.get("modified", row.get("Modified", "")),
             ))
 
         logger.info("Got %d tickets from query", len(tickets))
