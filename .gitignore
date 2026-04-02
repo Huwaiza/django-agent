@@ -8,3 +8,4 @@ logs/*.log
 .env
 *.tar.gz
 .idea
+venv
