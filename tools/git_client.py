@@ -68,7 +68,11 @@ class GitClient:
         return self._git("pull", "--rebase", "origin", "main")
 
     def create_branch(self, branch_name: str) -> CommandResult:
-        """Create and checkout a new branch from main."""
+        """Create and checkout a new branch from main. If branch already exists, resume it."""
+        existing = self._git("branch", "--list", branch_name)
+        if existing.stdout.strip():
+            logger.info("Branch '%s' already exists — resuming", branch_name)
+            return self._git("checkout", branch_name)
         self.checkout_main_and_pull()
         return self._git("checkout", "-b", branch_name)
 

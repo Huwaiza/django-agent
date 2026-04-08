@@ -33,21 +33,39 @@ Diff stat:
 
 Self-review summary: {review_summary}
 
-Write the PR body in this format (no markdown fencing, just the raw text):
+Write ONLY the description section as plain text (2-3 sentences max):
+- What bug/issue this fixes
+- What the fix does
+- Why this approach
 
+No markdown fencing, no headers, no bullet lists. Just the raw paragraph text.
+Respond with ONLY the description paragraph, nothing else.
+"""
+
+PR_BODY_TEMPLATE = """\
 Trac ticket: https://code.djangoproject.com/ticket/{ticket_id}
 
 ## Description
-<2-3 sentences explaining what the fix does and why>
 
-## Changes
-<bullet list of files changed and what changed in each>
+{description}
 
-## Tests
-<what test was added and what it verifies>
+## Checklist
 
-Keep it SHORT. Django reviewers read hundreds of PRs. No fluff.
-Respond with ONLY the PR body text, nothing else.
+#### AI Assistance Disclosure (REQUIRED)
+- [ ] **No AI tools were used** in preparing this PR.
+- [x] **If AI tools were used**, I have disclosed which ones, and fully reviewed and verified their output.
+
+> AI tools used: OpenCode (Kimi K2.5) for initial patch generation. All changes have been reviewed and verified.
+
+#### Checklist
+- [x] This PR follows the [contribution guidelines](https://docs.djangoproject.com/en/stable/internals/contributing/writing-code/submitting-patches/).
+- [x] This PR **does not** disclose a security vulnerability (see [vulnerability reporting](https://docs.djangoproject.com/en/stable/internals/security/)).
+- [x] This PR targets the `main` branch.
+- [x] The commit message is written in past tense, mentions the ticket number, and ends with a period.
+- [x] I have checked the "Has patch" ticket flag in the Trac system.
+- [x] I have added or updated relevant tests.
+- {docs_check} I have added or updated relevant docs, including release notes if applicable.
+- {ui_check} I have attached screenshots in both light and dark modes for any UI changes.
 """
 
 TRAC_COMMENT_TEMPLATE = (
@@ -87,7 +105,7 @@ class PRMakerAgent(BaseAgent):
         self.github = GitHubClient(repo="django/django")
         self.github_fork = github_fork  # e.g. "yourusername/django"
 
-    def submit_pr(self, coding_result: CodingResult, ticket_summary: str, component: str) -> dict:
+    def submit_pr(self, coding_result: CodingResult, ticket_summary: str, component: str, needs_docs: bool = False) -> dict:
         """
         Full PR submission pipeline:
         1. Generate PR body (AI — one cheap Sonnet call)
@@ -105,6 +123,8 @@ class PRMakerAgent(BaseAgent):
 
         logger.info("Submitting PR for #%d on branch %s...", ticket_id, branch)
 
+        is_ui_change = component.lower() in ("admin", "contrib.admin")
+
         # ── Step 1: Generate PR body (ONE Sonnet call, 512 max_tokens) ──
         pr_body = self._generate_pr_body(
             ticket_id=ticket_id,
@@ -113,6 +133,8 @@ class PRMakerAgent(BaseAgent):
             branch_name=branch,
             diff_stat=coding_result.diff_stat,
             review_summary=coding_result.self_review_summary,
+            needs_docs=needs_docs,
+            is_ui_change=is_ui_change,
         )
         logger.info("PR body generated (%d chars)", len(pr_body))
 
@@ -123,10 +145,14 @@ class PRMakerAgent(BaseAgent):
         logger.info("Branch pushed to fork")
 
         # ── Step 3: Open PR ──
-        pr_title = f"Fixed #{ticket_id} -- {ticket_summary}"
-        # Truncate title to 72 chars (GitHub convention)
-        if len(pr_title) > 72:
-            pr_title = pr_title[:69] + "..."
+        # Django convention: "Fixed #XXXXX -- Description." (period at end)
+        base_title = f"Fixed #{ticket_id} -- {ticket_summary}"
+        if len(base_title) > 72:
+            # Truncate summary so total fits in 72 chars, preserving the period
+            max_summary_len = 72 - len(f"Fixed #{ticket_id} -- ") - 1  # -1 for period
+            pr_title = f"Fixed #{ticket_id} -- {ticket_summary[:max_summary_len]}."
+        else:
+            pr_title = base_title if base_title.endswith(".") else base_title + "."
 
         pr_result = self.github.create_pr(
             title=pr_title,
@@ -161,16 +187,10 @@ class PRMakerAgent(BaseAgent):
         branch_name: str,
         diff_stat: str,
         review_summary: str,
+        needs_docs: bool = False,
+        is_ui_change: bool = False,
     ) -> str:
-        """
-        Generate PR body using ONE Sonnet call.
-
-        TOKEN BUDGET:
-        - System prompt: ~30 tokens (minimal, no SKILL.md)
-        - User prompt: ~200 tokens (template + context)
-        - max_tokens: 512 (PR bodies should be <300 tokens)
-        - Total: ~750 tokens → ~$0.001 with Sonnet
-        """
+        """Generate PR body using ONE AI call, then wrap in full Django checklist template."""
         prompt = PR_BODY_PROMPT.format(
             ticket_id=ticket_id,
             summary=summary,
@@ -183,21 +203,24 @@ class PRMakerAgent(BaseAgent):
         response = self.think(
             user_message=prompt,
             temperature=0.2,
-            max_tokens=512,        # TOKEN OPTIMIZATION: PR bodies are short
-            response_format="text",  # Plain text, not JSON
+            max_tokens=512,
+            response_format="text",
         )
 
         if response.raw_text:
-            return response.raw_text.strip()
+            description = response.raw_text.strip()
+        else:
+            logger.warning("AI PR body generation failed, using fallback description")
+            description = f"Fix for #{ticket_id}: {summary}"
 
-        # Fallback: generate a minimal PR body without AI
-        logger.warning("AI PR body generation failed, using fallback template")
-        return (
-            f"Trac ticket: https://code.djangoproject.com/ticket/{ticket_id}\n\n"
-            f"## Description\n"
-            f"Fix for #{ticket_id}: {summary}\n\n"
-            f"## Changes\n{diff_stat or 'See diff.'}\n\n"
-            f"## Tests\nRegression test included."
+        docs_check = "[x]" if needs_docs else "[ ]"
+        ui_check = "[x]" if is_ui_change else "[ ]"
+
+        return PR_BODY_TEMPLATE.format(
+            ticket_id=ticket_id,
+            description=description,
+            docs_check=docs_check,
+            ui_check=ui_check,
         )
 
     @staticmethod

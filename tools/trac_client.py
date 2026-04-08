@@ -110,7 +110,6 @@ class TracClient:
         # Category 1: Easy pickings with no existing patch
         params = {
             "status": ["new", "assigned"],
-            "easy": "1",
             "has_patch": "0",
             "format": "csv",
             "col": [
@@ -119,7 +118,8 @@ class TracClient:
                 "has_patch", "needs_better_patch", "needs_tests",
                 "needs_docs", "modified", "created",
             ],
-            "order": "priority",
+            "order": "modified",
+            "desc": "1",
         }
         all_tickets.extend(self._fetch_ticket_list(params))
 

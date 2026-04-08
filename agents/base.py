@@ -182,20 +182,27 @@ class BaseAgent:
         temperature: float = 0.3,
         max_tokens: int = 1024,
         response_format: str = "json",
+        timeout: int = 120,
     ) -> AgentResponse:
         """Core reasoning method."""
-        full_message = (
-            f"YOU ARE: {self.system_prompt}\n\n"
-            f"IMPORTANT: You are NOT a coding assistant right now. "
-            f"You must follow the role above and answer the question below directly.\n\n"
+        if response_format == "json":
+            full_message = (
+                "OUTPUT FORMAT: You MUST respond with ONLY a valid JSON object or array. "
+                "No prose, no explanation, no markdown, no backticks. Start your response with { or [.\n\n"
+            )
+        else:
+            full_message = ""
+
+        full_message += (
+            f"YOUR ROLE: {self.system_prompt}\n\n"
         )
         if context:
             full_message += f"CONTEXT:\n{context}\n\n---\n\n"
         full_message += user_message
         if response_format == "json":
-            full_message += "\n\nRespond ONLY with valid JSON. No markdown fences, no backticks, no explanation."
+            full_message += "\n\nRemember: respond with ONLY the JSON. Start with { or [."
 
-        raw_text = self._call_opencode(full_message)
+        raw_text = self._call_opencode(full_message, timeout=timeout)
         usage = TokenUsage(model=self.model)
         self._record_usage(usage)
 
@@ -226,15 +233,32 @@ class BaseAgent:
 
     @staticmethod
     def _parse_json(text: str) -> Optional[dict]:
+        import re
         clean = text.strip()
+
+        # Strip markdown fences
         if clean.startswith("```"):
-            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-        if clean.endswith("```"):
-            clean = clean[:-3]
+            clean = re.sub(r"^```[a-z]*\n?", "", clean)
+            clean = re.sub(r"\n?```$", "", clean)
+            clean = clean.strip()
+
+        # Try direct parse first
         try:
-            return json.loads(clean.strip())
-        except (json.JSONDecodeError, IndexError):
-            return None
+            return json.loads(clean)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Extract JSON from prose — try array first, then object
+        # (array pattern must come first to avoid matching {} inside [{}])
+        for pattern in [r"\[[\s\S]*\]", r"\{[\s\S]*\}"]:
+            match = re.search(pattern, clean)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        return None
 
     @property
     def cost_summary(self) -> str:

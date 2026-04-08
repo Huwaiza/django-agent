@@ -75,6 +75,24 @@ File context: This is on branch {branch_name} for ticket #{ticket_id}.
 Apply the fix, run tests for the affected module, and amend the commit.
 """
 
+CI_FIX_PROMPT = """\
+A Django PR CI check failed. Diagnose and fix it.
+
+PR: #{ticket_id} — {summary}
+Branch: {branch_name}
+Failed check: {check_name}
+
+CI failure log:
+{failure_log}
+
+Instructions:
+- Read the exact error messages in the log above
+- Find the relevant file(s) in the repo and fix them
+- Do NOT change any Python logic — only fix the issue the CI is reporting
+- After fixing, amend the commit (git commit --amend --no-edit)
+- Do NOT push — the caller will push
+"""
+
 
 @dataclass
 class ReviewComment:
@@ -137,6 +155,99 @@ class ReviewHandlerAgent(BaseAgent):
             allowed_tools=["Read", "Edit", "Write", "Bash"],
             max_turns=15,
         ) if repo_path else None
+
+    def fix_ci_failures(self, pr_number: int, ticket_id: int, summary: str, branch_name: str) -> list[dict]:
+        """
+        Fetch CI check failures for a PR, fix each one via opencode, amend + push.
+
+        Returns list of dicts: {check_name, fixed, error}
+        """
+        import subprocess
+
+        if not self.git:
+            return [{"check_name": "all", "fixed": False, "error": "No repo_path configured"}]
+
+        # 1. Get failed checks
+        result = subprocess.run(
+            ["gh", "pr", "checks", str(pr_number), "--repo", "django/django",
+             "--json", "name,state,link"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return [{"check_name": "all", "fixed": False, "error": result.stderr.strip()}]
+
+        import json as _json
+        try:
+            checks = _json.loads(result.stdout)
+        except Exception:
+            return [{"check_name": "all", "fixed": False, "error": "Could not parse gh output"}]
+
+        failed = [c for c in checks if c.get("state", "").upper() in ("FAIL", "FAILURE", "ERROR")]
+        if not failed:
+            logger.info("No failed CI checks on PR #%d", pr_number)
+            return []
+
+        results = []
+        for check in failed:
+            check_name = check.get("name", "unknown")
+            details_url = check.get("link", "")
+            logger.info("Fetching failure log for check '%s'...", check_name)
+
+            # Fetch the run log via gh
+            log_result = subprocess.run(
+                ["gh", "run", "view", "--log-failed", "--repo", "django/django",
+                 details_url.split("/job/")[0].split("/runs/")[-1].split("/")[0]
+                 if "/runs/" in details_url else ""],
+                capture_output=True, text=True, timeout=30,
+            )
+            failure_log = log_result.stdout[:4000] if log_result.stdout else "(no log available)"
+
+            if not failure_log.strip() or failure_log == "(no log available)":
+                # Try fetching the run ID from the URL differently
+                import re
+                run_id_match = re.search(r"/runs/(\d+)", details_url)
+                if run_id_match:
+                    log_result2 = subprocess.run(
+                        ["gh", "run", "view", run_id_match.group(1), "--log-failed",
+                         "--repo", "django/django"],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    failure_log = log_result2.stdout[:4000] if log_result2.stdout else failure_log
+
+            logger.info("CI log (%d chars) fetched for '%s'", len(failure_log), check_name)
+
+            # Checkout the branch
+            self.git._git("checkout", branch_name)
+
+            # Ask opencode to fix it
+            fix_prompt = CI_FIX_PROMPT.format(
+                ticket_id=ticket_id,
+                summary=summary,
+                branch_name=branch_name,
+                check_name=check_name,
+                failure_log=failure_log,
+            )
+
+            if self.claude_code:
+                fix_result = self.claude_code.run(prompt=fix_prompt, timeout=300)
+                fixed = fix_result.success
+                error = fix_result.error if not fixed else None
+            else:
+                fixed = False
+                error = "No claude_code client configured"
+
+            if fixed:
+                # Push the fix
+                push = self.git._git("push", "origin", branch_name, "--force-with-lease", "--force-if-includes")
+                if not push.success:
+                    fixed = False
+                    error = f"Push failed: {push.stderr}"
+                else:
+                    logger.info("Fix for '%s' pushed to branch %s", check_name, branch_name)
+
+            results.append({"check_name": check_name, "fixed": fixed, "error": error})
+
+        return results
 
     def check_and_handle_reviews(self, open_prs: list[dict]) -> list[ReviewAction]:
         """

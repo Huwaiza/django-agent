@@ -53,6 +53,8 @@ Be strict. Only give "PICK" verdict to tickets where:
 - You can sketch a reasonable approach
 
 Give "SKIP" for tickets that are:
+- Triage Stage is "Unreviewed" — the Django core team has not accepted it yet,
+  working on it risks wasted effort if it gets closed as invalid
 - Actively being worked on by someone
 - Too vague or controversial
 - Require deep framework internals knowledge
@@ -77,9 +79,9 @@ For each ticket, respond with a JSON array where each element is:
 }}
 
 Skip tickets where:
-- Someone is listed as owner (likely being worked on)
 - The type is "New feature" (usually too large for easy pickings)
 - The summary suggests deep ORM/migration internals
+- There is clear recent activity (comments in the last few weeks) showing someone is mid-PR
 
 Mark as PROMISING:
 - Bug fixes with clear, specific summaries
@@ -137,7 +139,7 @@ class ScoutAgent(BaseAgent):
         )
         self.trac = TracClient(rate_limit_seconds=1.0)
 
-    def discover(self, deep_eval_limit: int = 10) -> list[TicketEvaluation]:
+    def discover(self, deep_eval_limit: int = 20, stop_on_first_pick: bool = False) -> list[TicketEvaluation]:
         """
         Full discovery pipeline:
         1. Fetch all easy-picking tickets from Trac (tool)
@@ -146,7 +148,8 @@ class ScoutAgent(BaseAgent):
         4. AI deep-evaluates each promising ticket (thorough)
 
         Args:
-            deep_eval_limit: Max tickets to deep-evaluate (controls cost)
+            deep_eval_limit: Max tickets to deep-evaluate
+            stop_on_first_pick: Stop as soon as one PICK is found
 
         Returns:
             List of TicketEvaluation objects, sorted by score descending
@@ -186,6 +189,11 @@ class ScoutAgent(BaseAgent):
                     evaluation.score,
                     ticket.summary[:50],
                 )
+
+                if stop_on_first_pick and evaluation.verdict == "PICK":
+                    logger.info("Found a PICK — stopping early (--stop-on-pick mode)")
+                    break
+
             except Exception as e:
                 logger.error("Failed to evaluate #%d: %s", ticket.ticket_id, e)
 
@@ -193,52 +201,34 @@ class ScoutAgent(BaseAgent):
         evaluations.sort(key=lambda e: e.score, reverse=True)
         return evaluations
 
-    def _batch_triage(self, tickets: list[TracTicket]) -> list[TracTicket]:
-        """
-        Phase 1: AI quick-passes all ticket summaries.
+    # Django Trac triage stages that are safe to work on.
+    # "Unreviewed" means the ticket has not been accepted by the core team yet —
+    # working on it risks wasted effort if the ticket is later closed as invalid.
+    WORKABLE_STAGES = {
+        "Accepted",
+        "Ready for checkin",
+        "Someday/Maybe",
+    }
 
-        This is intentionally cheap — we send just the summaries to Sonnet
-        and ask for a quick PROMISING/SKIP/NEEDS_DETAIL verdict.
-
-        Returns the tickets worth deep-evaluating.
+    def _batch_triage(self, tickets: list[TracTicket], chunk_size: int = 20) -> list[TracTicket]:
         """
-        # Format summaries for the AI
-        summaries = []
-        for t in tickets:
-            summaries.append(
-                f"#{t.ticket_id} | {t.component} | {t.ticket_type} | "
-                f"Owner: {t.owner or '(none)'} | {t.summary}"
+        Phase 1: Fast heuristic triage — no AI, no timeouts.
+
+        Hard-filters tickets whose Triage Stage is "Unreviewed" — these haven't
+        been accepted by the Django core team and should not be claimed.
+        Everything else passes through to Phase 2 deep eval.
+        """
+        before = len(tickets)
+        tickets = [t for t in tickets if t.stage.strip() not in ("Unreviewed", "")]
+        dropped = before - len(tickets)
+        if dropped:
+            logger.info(
+                "Heuristic triage: dropped %d Unreviewed tickets, %d remain for deep eval",
+                dropped, len(tickets),
             )
-
-        prompt = BATCH_TRIAGE_TEMPLATE.format(
-            ticket_summaries="\n".join(summaries)
-        )
-
-        response = self.think(
-            user_message=prompt,
-            temperature=0.2,
-            max_tokens=2048,  # TOKEN OPTIMIZATION: batch JSON is repetitive, 2K is plenty
-        )
-
-        if not response.succeeded:
-            # Fallback: if AI triage fails, take all tickets for deep eval
-            logger.warning("Batch triage failed, falling back to all tickets")
-            return tickets
-
-        # Parse AI's triage decisions
-        ticket_map = {t.ticket_id: t for t in tickets}
-        shortlist = []
-
-        for item in response.parsed:
-            tid = item.get("ticket_id")
-            verdict = item.get("quick_verdict", "SKIP")
-
-            if verdict in ("PROMISING", "NEEDS_DETAIL") and tid in ticket_map:
-                shortlist.append(ticket_map[tid])
-            elif verdict == "SKIP":
-                logger.debug("Triage SKIP #%d: %s", tid, item.get("one_line_reason", ""))
-
-        return shortlist
+        else:
+            logger.info("Heuristic triage: all %d tickets already past Unreviewed stage", len(tickets))
+        return tickets
 
     def _deep_evaluate(self, ticket: TracTicket) -> TicketEvaluation:
         """
@@ -250,6 +240,30 @@ class ScoutAgent(BaseAgent):
         - What's the fix approach?
         - What are the risks?
         """
+        # Hard gate — never evaluate Unreviewed tickets regardless of how we got here.
+        # fetch_ticket_detail() populates the stage from the Trac page, so this is
+        # always authoritative even when called via --ticket or evaluate_single().
+        if ticket.stage.strip() == "Unreviewed":
+            logger.info(
+                "  #%d SKIP — Triage Stage is Unreviewed (not accepted by core team)",
+                ticket.ticket_id,
+            )
+            return TicketEvaluation(
+                ticket_id=ticket.ticket_id,
+                ticket=ticket,
+                verdict="SKIP",
+                score=0,
+                reasoning="Triage Stage is Unreviewed — ticket has not been accepted by the Django core team.",
+                risk_factors=["unreviewed"],
+                fix_approach=None,
+                estimated_complexity="unknown",
+                someone_working=False,
+                has_existing_pr=False,
+                clarity="unclear",
+                component_depth="unknown",
+                raw_response=AgentResponse(raw_text=""),
+            )
+
         prompt = EVALUATION_REQUEST_TEMPLATE.format(
             ticket_context=ticket.to_context_string()
         )
@@ -257,7 +271,8 @@ class ScoutAgent(BaseAgent):
         response = self.think(
             user_message=prompt,
             temperature=0.2,
-            max_tokens=768,  # TOKEN OPTIMIZATION: eval JSON response is ~400 tokens
+            max_tokens=768,
+            timeout=180,
         )
 
         if not response.succeeded:

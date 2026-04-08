@@ -52,6 +52,10 @@ class SystemState:
     # Learnings
     skill_md_version: int = 0
 
+    # Scout history — every scout run appended, never overwritten
+    scout_history: list[dict] = field(default_factory=list)
+    last_scout_at: Optional[str] = None
+
     def to_context_string(self) -> str:
         """Format state for the Orchestrator AI to read."""
         ready_for_pr = [t for t in self.active_tickets if t.get("status") == "ready_for_pr"]
@@ -350,11 +354,12 @@ class Orchestrator(BaseAgent):
         ready_for_pr = [t for t in self.state.active_tickets if t.get("status") == "ready_for_pr"]
         if ready_for_pr:
             return {"actions": ["SUBMIT_PR"], "reasoning": "fallback: tickets ready for PR", "confidence": 0.8}
-        if not self.state.candidates:
-            return {"actions": ["SCOUT"], "reasoning": "fallback: no candidates", "confidence": 0.5}
+        viable_candidates = [e for e in self.state.candidates if e.is_candidate]
+        if viable_candidates:
+            return {"actions": ["PICK_AND_CODE"], "reasoning": f"fallback: {len(viable_candidates)} saved candidates, skipping scout", "confidence": 0.8}
         if self.state.open_prs:
             return {"actions": ["CHECK_REVIEWS"], "reasoning": "fallback: has open PRs", "confidence": 0.5}
-        return {"actions": ["SCOUT"], "reasoning": "fallback: default", "confidence": 0.3}
+        return {"actions": ["SCOUT"], "reasoning": "fallback: no candidates, need to scout", "confidence": 0.5}
 
     def _execute_action(self, action: str) -> dict:
         """Execute a single action by invoking the appropriate sub-agent."""
@@ -381,7 +386,34 @@ class Orchestrator(BaseAgent):
         """Run the Scout agent to find new candidates."""
         try:
             evaluations = self.scout.discover(deep_eval_limit=10)
-            self.state.candidates = evaluations
+
+            # IDs already acted on — don't resurface as candidates
+            acted_ids = (
+                {t.get("ticket_id") for t in self.state.active_tickets}
+                | {p.get("ticket_id") for p in self.state.open_prs}
+                | {p.get("ticket_id") for p in self.state.merged_prs}
+                | {p.get("ticket_id") for p in self.state.rejected_prs}
+            )
+            new_evals = [e for e in evaluations if e.ticket_id not in acted_ids]
+
+            # Merge: existing candidates keyed by ticket_id; new run overwrites stale entries
+            existing_by_id = {e.ticket_id: e for e in self.state.candidates}
+            for e in new_evals:
+                existing_by_id[e.ticket_id] = e
+            self.state.candidates = list(existing_by_id.values())
+
+            # Append to history — never overwrite past runs
+            self.state.scout_history.append({
+                "scanned_at": datetime.now().isoformat(),
+                "evaluated": len(evaluations),
+                "new_candidate_ids": [e.ticket_id for e in new_evals if e.is_candidate],
+                "results": [
+                    {"ticket_id": e.ticket_id, "verdict": e.verdict,
+                     "score": e.score, "summary": e.ticket.summary[:60]}
+                    for e in evaluations
+                ],
+            })
+            self.state.last_scout_at = datetime.now().isoformat()
 
             picks = [e for e in evaluations if e.verdict == "PICK"]
             maybes = [e for e in evaluations if e.verdict == "MAYBE"]
@@ -451,6 +483,7 @@ class Orchestrator(BaseAgent):
             "summary": selected_eval.ticket.summary,
             "component": selected_eval.ticket.component,
             "fix_approach": selected_eval.fix_approach,
+            "needs_docs": getattr(selected_eval.ticket, "needs_docs", False),
             "picked_at": datetime.now().isoformat(),
             "status": "coding",
         })
@@ -521,11 +554,33 @@ class Orchestrator(BaseAgent):
         }
 
     def _action_check_reviews(self) -> dict:
-        """Check open PRs for new reviewer comments and handle them."""
+        """Check open PRs for CI failures and reviewer comments."""
         if not self.state.open_prs:
             logger.info("No open PRs to check")
             return {"status": "no_open_prs"}
 
+        # ── Step 1: Fix CI failures first ──
+        ci_results = []
+        for pr in self.state.open_prs:
+            pr_number = pr.get("pr_number")
+            if not pr_number:
+                continue
+            ticket_id = pr.get("ticket_id", 0)
+            summary = pr.get("summary", "")
+            branch = pr.get("branch", f"ticket_{ticket_id}")
+            logger.info("Checking CI for PR #%d...", pr_number)
+            fixes = self.review_handler.fix_ci_failures(
+                pr_number=pr_number,
+                ticket_id=ticket_id,
+                summary=summary,
+                branch_name=branch,
+            )
+            if fixes:
+                ci_results.extend(fixes)
+                for fix in fixes:
+                    logger.info("  CI fix '%s': fixed=%s", fix["check_name"], fix["fixed"])
+
+        # ── Step 2: Handle human reviewer comments ──
         logger.info("Checking %d open PRs for reviewer comments...", len(self.state.open_prs))
         actions = self.review_handler.check_and_handle_reviews(self.state.open_prs)
 
@@ -599,6 +654,8 @@ class Orchestrator(BaseAgent):
             "status": "reviewed", "total_comments": len(actions),
             "auto_handled": len(auto_handled), "approvals": len(approvals),
             "escalated": len(escalations),
+            "ci_fixes": len([f for f in ci_results if f.get("fixed")]),
+            "ci_failures_remaining": len([f for f in ci_results if not f.get("fixed")]),
         }
 
     def _action_submit_pr(self) -> dict:
@@ -644,6 +701,7 @@ class Orchestrator(BaseAgent):
                 coding_result=coding_result,
                 ticket_summary=summary,
                 component=component,
+                needs_docs=ticket_entry.get("needs_docs", False),
             )
 
             if pr_result["success"]:
@@ -756,6 +814,44 @@ class Orchestrator(BaseAgent):
                 state.last_run_at = data.get("last_run_at")
                 state.circuit_breaker_active = data.get("circuit_breaker_active", False)
                 state.skill_md_version = data.get("skill_md_version", 0)
+                state.scout_history = data.get("scout_history", [])
+                state.last_scout_at = data.get("last_scout_at")
+
+                # Restore saved candidates so we skip re-scouting
+                raw_candidates = data.get("candidates", [])
+                if raw_candidates:
+                    from tools.trac_client import TracTicket
+                    restored = []
+                    for c in raw_candidates:
+                        ticket = TracTicket(
+                            ticket_id=c["ticket_id"],
+                            summary=c.get("summary", ""),
+                            component=c.get("component", ""),
+                            ticket_type=c.get("ticket_type", ""),
+                            severity="", version="", owner="", reporter="",
+                            status="", stage="", has_patch=False,
+                            needs_better_patch=False, needs_tests=False,
+                            needs_docs=False, easy_picking=True,
+                        )
+                        from agents.base import AgentResponse, TokenUsage
+                        restored.append(TicketEvaluation(
+                            ticket_id=c["ticket_id"],
+                            ticket=ticket,
+                            verdict=c.get("verdict", "PICK"),
+                            score=c.get("score", 0),
+                            reasoning=c.get("reasoning", ""),
+                            risk_factors=c.get("risk_factors", []),
+                            fix_approach=c.get("fix_approach"),
+                            estimated_complexity=c.get("complexity", "simple"),
+                            someone_working=False,
+                            has_existing_pr=False,
+                            clarity=c.get("clarity", "clear"),
+                            component_depth=c.get("component_depth", "surface"),
+                            raw_response=AgentResponse(raw_text="", usage=TokenUsage()),
+                        ))
+                    state.candidates = restored
+                    logger.info("Restored %d candidates from state file — skipping scout", len(restored))
+
                 return state
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning("Failed to load state: %s, starting fresh", e)
@@ -774,6 +870,25 @@ class Orchestrator(BaseAgent):
             "last_run_at": self.state.last_run_at,
             "circuit_breaker_active": self.state.circuit_breaker_active,
             "skill_md_version": self.state.skill_md_version,
+            "last_scout_at": self.state.last_scout_at,
+            "scout_history": self.state.scout_history,
+            "candidates": [
+                {
+                    "ticket_id": e.ticket_id,
+                    "summary": e.ticket.summary,
+                    "component": e.ticket.component,
+                    "ticket_type": e.ticket.ticket_type,
+                    "verdict": e.verdict,
+                    "score": e.score,
+                    "reasoning": e.reasoning,
+                    "risk_factors": e.risk_factors,
+                    "fix_approach": e.fix_approach,
+                    "complexity": e.estimated_complexity,
+                    "clarity": e.clarity,
+                    "component_depth": e.component_depth,
+                }
+                for e in self.state.candidates
+            ],
         }
         self.state_path.write_text(json.dumps(data, indent=2))
 
